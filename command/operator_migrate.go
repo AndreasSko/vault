@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -36,6 +37,7 @@ type OperatorMigrateCommand struct {
 	flagConfig       string
 	flagStart        string
 	flagReset        bool
+	flagCheck        bool
 	logger           log.Logger
 	ShutdownCh       chan struct{}
 }
@@ -95,6 +97,12 @@ func (c *OperatorMigrateCommand) Flags() *FlagSets {
 		Usage:  "Reset the migration lock. No migration will occur.",
 	})
 
+	f.BoolVar(&BoolVar{
+		Name:   "check",
+		Target: &c.flagCheck,
+		Usage:  "Check if all keys have been migrated. No migration will occur.",
+	})
+
 	return set
 }
 
@@ -126,6 +134,15 @@ func (c *OperatorMigrateCommand) Run(args []string) int {
 		return 1
 	}
 
+	if c.flagCheck {
+		c.UI.Info("Running check")
+		if err := c.checkKeys(config); err != nil {
+			c.UI.Error(fmt.Sprintf("Error checking: %s", err))
+			return 2
+		}
+		return 0
+	}
+
 	if err := c.migrate(config); err != nil {
 		if err == errAbort {
 			return 0
@@ -141,6 +158,68 @@ func (c *OperatorMigrateCommand) Run(args []string) int {
 	}
 
 	return 0
+}
+
+func (c *OperatorMigrateCommand) checkKeys(config *migratorConfig) error {
+	from, err := c.newBackend(config.StorageSource.Type, config.StorageSource.Config)
+	if err != nil {
+		return errwrap.Wrapf("error mounting 'storage_source': {{err}}", err)
+	}
+	to, err := c.createDestinationBackend(config.StorageDestination.Type, config.StorageDestination.Config, config)
+	if err != nil {
+		return errwrap.Wrapf("error mounting 'storage_destination': {{err}}", err)
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	doneCh := make(chan error)
+	go func() {
+		doneCh <- c.checkAll(ctx, from, to)
+	}()
+
+	select {
+	case err := <-doneCh:
+		cancelFunc()
+		return err
+	case <-c.ShutdownCh:
+		c.UI.Output("==> Checking shutdown triggered\n")
+		cancelFunc()
+		<-doneCh
+		return errAbort
+	}
+}
+
+func (c *OperatorMigrateCommand) checkAll(ctx context.Context, from physical.Backend, to physical.Backend) error {
+	return dfsScan(ctx, from, func(ctx context.Context, path string) error {
+		entry, err := from.Get(ctx, path)
+
+		if err != nil {
+			return errwrap.Wrapf("error reading entry: {{err}}", err)
+		}
+
+		if entry == nil {
+			return nil
+		}
+
+		newEntry, err := to.Get(ctx, path)
+		if err != nil {
+			c.UI.Error(fmt.Sprintf("Did not find %s", path))
+			return nil
+		}
+
+		if newEntry == nil {
+			c.UI.Error(fmt.Sprintf("Found entry but it is empty %s", path))
+			return nil
+		}
+
+		if entry.Key != newEntry.Key || bytes.Compare(entry.Value, newEntry.Value) != 0 {
+			c.UI.Error(fmt.Sprintf("Found keys that are not equal: %#v (from) vs %#v (to)", entry, newEntry))
+			return nil
+		}
+
+		c.logger.Info("Checked key", "path", path)
+		return nil
+	})
 }
 
 // migrate attempts to instantiate the source and destinations backends,
